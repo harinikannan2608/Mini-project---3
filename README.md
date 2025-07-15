@@ -1,122 +1,214 @@
-import os, pickle, warnings
 import pandas as pd
 import numpy as np
-import streamlit as st
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pickle
 
-warnings.filterwarnings("ignore")
+from scipy.stats import zscore, chi2_contingency
+from sklearn.preprocessing import LabelEncoder
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import LinearRegression, Ridge, Lasso
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
 
-st.title("NYC Taxi Fare Prediction App 🚖")
+sns.set(style="whitegrid")
 
-MODEL_FILE = "best_model.pkl"
-SCALER_FILE = "scaler.pkl"
-FEATURES_FILE = "features.pkl"
+# ------------------------------------
+# Data Collection
+# ------------------------------------
+print("Loading dataset...")
+file_id = "1VUb9ucTsroGDBOPcwpOfXwzDi-rd4wqQ"
+download_url = f"https://drive.google.com/uc?id={file_id}"
+df = pd.read_csv(download_url)
+print("Dataset loaded\n")
 
-# ----------------------------
-# Step 1: Train Model (if needed)
-# ----------------------------
-@st.cache_resource
-def train_model():
-    st.info("Training model for the first time... please wait ⏳")
-    url = "https://drive.google.com/uc?id=1VUb9ucTsroGDBOPcwpOfXwzDi-rd4wqQ"
-    df = pd.read_csv(url)
+# ------------------------------------
+# Data Understanding
+# ------------------------------------
+print(f"Shape: {df.shape}")
+print("\nColumns & Data Types:\n", df.dtypes)
+print("\nMissing Values:\n", df.isnull().sum())
+print("\nDuplicate Rows:", df.duplicated().sum())
+print("\nSummary Statistics:\n", df.describe())
 
-    # Clean & engineer
-    df.drop_duplicates(inplace=True)
-    df.dropna(inplace=True)
+# ------------------------------------
+# Feature Engineering
+# ------------------------------------
+pickup_col = 'tpep_pickup_datetime'
+dropoff_col = 'tpep_dropoff_datetime'
 
-    df['trip_distance'] = df['trip_distance'].replace(0, np.nan)
-    df.dropna(subset=['trip_distance'], inplace=True)
+df[pickup_col] = pd.to_datetime(df[pickup_col], errors='coerce')
+df[dropoff_col] = pd.to_datetime(df[dropoff_col], errors='coerce')
 
-    features = [
-        'VendorID', 'RatecodeID', 'payment_type',
-        'pickup_latitude', 'pickup_longitude', 'dropoff_latitude', 'dropoff_longitude',
-        'passenger_count', 'trip_distance', 'fare_amount', 'extra', 'mta_tax',
-        'tip_amount', 'tolls_amount', 'improvement_surcharge'
-    ]
-    target = 'total_amount'
+df['pickup_hour'] = df[pickup_col].dt.hour
+df['pickup_day'] = df[pickup_col].dt.day_name()
+df['is_weekend'] = df['pickup_day'].isin(['Saturday', 'Sunday']).astype(int)
+df['is_night'] = df['pickup_hour'].apply(lambda x: 1 if (x >= 22 or x < 5) else 0)
+df['trip_duration_min'] = (df[dropoff_col] - df[pickup_col]).dt.total_seconds() / 60
 
-    X = df[features]
-    y = df[target]
+def haversine(lon1, lat1, lon2, lat2):
+    lon1, lat1, lon2, lat2 = map(np.radians, [lon1, lat1, lon2, lat2])
+    dlon = lon2 - lon1 
+    dlat = lat2 - lat1 
+    a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
+    c = 2 * np.arcsin(np.sqrt(a))
+    km = 6371 * c
+    return km
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+df['trip_distance_km'] = haversine(
+    df['pickup_longitude'], df['pickup_latitude'],
+    df['dropoff_longitude'], df['dropoff_latitude']
+)
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_scaled, y, test_size=0.2, random_state=42
-    )
+df['fare_per_km'] = df['total_amount'] / df['trip_distance_km']
+df['fare_per_min'] = df['total_amount'] / df['trip_duration_min']
 
-    model = RandomForestRegressor(n_estimators=100, random_state=42)
+print("Feature engineering completed\n")
+
+# ------------------------------------
+# Data Transformation
+# ------------------------------------
+def remove_outliers_z(df, cols, threshold=3):
+    df_clean = df.copy()
+    for col in cols:
+        z = np.abs(zscore(df_clean[col].dropna()))
+        df_clean = df_clean[(z < threshold) | df_clean[col].isnull()]
+    return df_clean
+
+print("Handling outliers")
+num_cols = ['total_amount', 'trip_distance_km', 'trip_duration_min']
+df = remove_outliers_z(df, num_cols)
+print("Outliers removed")
+
+for col in num_cols:
+    if df[col].isnull().any():
+        df[col].fillna(df[col].median(), inplace=True)
+    if abs(df[col].skew()) > 1:
+        if (df[col] >= 0).all():
+            df[f'{col}_log'] = np.log1p(df[col])
+
+print("Skewness fixed")
+
+le = LabelEncoder()
+df['pickup_day_enc'] = le.fit_transform(df['pickup_day'])
+print("Categorical encoding completed\n")
+
+# ------------------------------------
+# Feature Selection
+# ------------------------------------
+print("Performing Feature Selection")
+
+target = 'total_amount'
+features = [
+    'trip_distance_km', 'trip_duration_min', 'pickup_hour',
+    'is_weekend', 'is_night', 'fare_per_km', 'fare_per_min', 'pickup_day_enc'
+]
+
+X = df[features]
+y = df[target]
+
+X = X.replace([np.inf, -np.inf], np.nan)
+X = X.fillna(0)
+
+print("Pearson Correlation with Target")
+print(df[features + [target]].corr()[target].sort_values(ascending=False))
+
+print("Chi-Square Test for Categorical Variables")
+df['target_binned'] = pd.qcut(y, q=4, labels=False)
+cat_cols = ['is_weekend', 'is_night', 'pickup_day_enc']
+for col in cat_cols:
+    contingency = pd.crosstab(df[col], df['target_binned'])
+    chi2, p, dof, ex = chi2_contingency(contingency)
+    print(f"{col}: Chi2 = {chi2:.2f}, p-value = {p:.4f}")
+
+print("Feature Importance from Random Forest")
+rf = RandomForestRegressor(random_state=42)
+rf.fit(X, y)
+importances = pd.Series(rf.feature_importances_, index=features).sort_values(ascending=False)
+print(importances)
+
+plt.figure(figsize=(8,6))
+importances.plot(kind='bar')
+plt.title("Feature Importance from Random Forest")
+plt.ylabel("Importance")
+plt.show()
+
+print("Feature Selection completed\n")
+
+# ------------------------------------
+# Model Building
+# ------------------------------------
+print("Building and evaluating regression models")
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+models = {
+    'LinearRegression': LinearRegression(),
+    'Ridge': Ridge(),
+    'Lasso': Lasso(),
+    'RandomForest': RandomForestRegressor(random_state=42),
+    'GradientBoosting': GradientBoostingRegressor(random_state=42)
+}
+
+results = []
+
+for name, model in models.items():
     model.fit(X_train, y_train)
+    preds = model.predict(X_test)
+    r2 = r2_score(y_test, preds)
+    mse = mean_squared_error(y_test, preds)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_test, preds)
+    results.append([name, r2, mse, rmse, mae])
 
-    y_pred = model.predict(X_test)
-    r2 = r2_score(y_test, y_pred)
-    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-    mae = mean_absolute_error(y_test, y_pred)
+results_df = pd.DataFrame(results, columns=['Model', 'R2', 'MSE', 'RMSE', 'MAE'])
+print("\nModel Comparison:\n", results_df.sort_values(by='R2', ascending=False))
 
-    # Save artifacts
-    with open(MODEL_FILE, "wb") as f:
-        pickle.dump(model, f)
-    with open(SCALER_FILE, "wb") as f:
-        pickle.dump(scaler, f)
-    with open(FEATURES_FILE, "wb") as f:
-        pickle.dump(features, f)
+best_model_name = results_df.sort_values(by='R2', ascending=False).iloc[0]['Model']
+print(f"\nBest model based on R2: {best_model_name}")
 
-    st.success(f"Model trained. R²: {r2:.3f}, RMSE: {rmse:.2f}, MAE: {mae:.2f}")
-    return model, scaler, features
+# ------------------------------------
+# Hyperparameter Tuning (faster)
+# ------------------------------------
+print("\nHyperparameter tuning for best model (RandomizedSearchCV)")
 
+param_dist = {
+    'n_estimators': [10, 50, 100],
+    'max_depth': [5, 10, 15, 20],
+    'min_samples_split': [2, 5],
+    'min_samples_leaf': [1, 2, 4]
+}
 
-# ----------------------------
-# Step 2: Load Model & Artifacts
-# ----------------------------
-if os.path.exists(MODEL_FILE) and os.path.exists(SCALER_FILE) and os.path.exists(FEATURES_FILE):
-    with open(MODEL_FILE, "rb") as f:
-        model = pickle.load(f)
-    with open(SCALER_FILE, "rb") as f:
-        scaler = pickle.load(f)
-    with open(FEATURES_FILE, "rb") as f:
-        features = pickle.load(f)
-else:
-    model, scaler, features = train_model()
+# Optional: sample smaller set just for tuning
+X_tune, _, y_tune, _ = train_test_split(X_train, y_train, train_size=5000, random_state=42)
 
+random_search = RandomizedSearchCV(
+    estimator=RandomForestRegressor(random_state=42),
+    param_distributions=param_dist,
+    n_iter=10,
+    cv=3,
+    scoring='r2',
+    verbose=2,
+    random_state=42,
+    n_jobs=-1
+)
 
-# ----------------------------
-# Step 3: Prediction UI
-# ----------------------------
+random_search.fit(X_tune, y_tune)
 
-st.header("Enter Trip Details")
+print("Best parameters:", random_search.best_params_)
+best_model = random_search.best_estimator_
+preds = best_model.predict(X_test)
 
-vendor_id = st.selectbox("Vendor ID", [1, 2])
-ratecode_id = st.selectbox("Rate Code ID", [1, 2, 3, 4, 5, 6])
-payment_type = st.selectbox("Payment Type", [1, 2, 3, 4, 5, 6])
+print("\nPerformance of Tuned RandomForest:")
+print(f"R2: {r2_score(y_test, preds):.4f}")
+print(f"MSE: {mean_squared_error(y_test, preds):.4f}")
+print(f"RMSE: {np.sqrt(mean_squared_error(y_test, preds)):.4f}")
+print(f"MAE: {mean_absolute_error(y_test, preds):.4f}")
 
-pickup_latitude = st.number_input("Pickup Latitude", value=40.7589)
-pickup_longitude = st.number_input("Pickup Longitude", value=-73.9851)
-dropoff_latitude = st.number_input("Dropoff Latitude", value=40.7612)
-dropoff_longitude = st.number_input("Dropoff Longitude", value=-73.9776)
+# ------------------------------------
+# Save Best Model
+# ------------------------------------
+with open("best_model.pkl", "wb") as f:
+    pickle.dump(best_model, f)
 
-passenger_count = st.slider("Passenger Count", 1, 6, 1)
-trip_distance = st.number_input("Trip Distance (km)", min_value=0.1, value=2.0)
-
-fare_amount = st.number_input("Base Fare ($)", min_value=0.0, value=10.0)
-extra = st.number_input("Extra Charges ($)", min_value=0.0, value=0.5)
-mta_tax = st.number_input("MTA Tax ($)", min_value=0.0, value=0.5)
-tip_amount = st.number_input("Tip Amount ($)", min_value=0.0, value=1.5)
-tolls_amount = st.number_input("Tolls Amount ($)", min_value=0.0, value=0.0)
-improvement_surcharge = st.number_input("Improvement Surcharge ($)", min_value=0.0, value=0.3)
-
-if st.button("Predict Fare"):
-    input_data = pd.DataFrame([[
-        vendor_id, ratecode_id, payment_type,
-        pickup_latitude, pickup_longitude, dropoff_latitude, dropoff_longitude,
-        passenger_count, trip_distance, fare_amount, extra, mta_tax,
-        tip_amount, tolls_amount, improvement_surcharge
-    ]], columns=features)
-
-    input_scaled = scaler.transform(input_data)
-    prediction = model.predict(input_scaled)[0]
-
-    st.success(f"🎯 Predicted Total Fare: ${prediction:.2f}")
+print("\n✅ Best model saved as 'best_model.pkl'")
